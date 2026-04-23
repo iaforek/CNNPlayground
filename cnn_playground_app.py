@@ -25,6 +25,8 @@ from torchvision import datasets, transforms
 ROOT = Path("./data")
 CHECKPOINT_DIR = Path("./checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+DRAWING_SAVE_DIR = Path("./saved_drawings")
+DRAWING_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
 
@@ -691,8 +693,11 @@ def train_experiment(
 
 
 # ============================================================
-# Drawing and prediction
+# Drawing, prediction, saving, batch testing
 # ============================================================
+
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
 
 def denormalize_tensor(x: torch.Tensor, mean: Tuple[float, ...], std: Tuple[float, ...]) -> torch.Tensor:
     mean_t = torch.tensor(mean).view(-1, 1, 1)
@@ -701,29 +706,50 @@ def denormalize_tensor(x: torch.Tensor, mean: Tuple[float, ...], std: Tuple[floa
 
 
 
-def preprocess_canvas_image(image: Any, image_size: int) -> Tuple[Image.Image, torch.Tensor]:
+def editor_value_to_numpy(image: Any) -> np.ndarray:
     if image is None:
-        raise ValueError("Please draw something first.")
+        raise ValueError("Please provide an image first.")
 
-    # gr.Sketchpad / gr.ImageEditor often returns a dict.
-    # We want the merged drawing layer.
     if isinstance(image, dict):
-        image = image.get("composite", None)
-        if image is None:
-            raise ValueError("Could not read the sketchpad image. Please draw again.")
+        if image.get("composite") is not None:
+            image = image["composite"]
+        elif image.get("background") is not None:
+            image = image["background"]
+        elif image.get("layers"):
+            image = image["layers"][-1]
+        else:
+            raise ValueError("Could not read the editor image.")
 
-    if image.ndim == 3:
-        image = image[..., 0]
+    if isinstance(image, (str, Path)):
+        pil = Image.open(image)
+    elif isinstance(image, Image.Image):
+        pil = image
+    else:
+        pil = Image.fromarray(np.array(image).astype(np.uint8))
 
-    pil = Image.fromarray(image.astype(np.uint8)).convert("L")
+    pil = pil.convert("RGBA") if pil.mode not in ("L", "RGB", "RGBA") else pil
+    if pil.mode == "RGBA":
+        white_bg = Image.new("RGBA", pil.size, (255, 255, 255, 255))
+        pil = Image.alpha_composite(white_bg, pil).convert("L")
+    else:
+        pil = pil.convert("L")
 
-    # Gradio drawing tends to be dark-on-light. MNIST expects light digit on dark background.
+    return np.array(pil)
+
+
+
+def preprocess_image_for_model(image: Any, image_size: int) -> Tuple[Image.Image, torch.Tensor]:
+    arr = editor_value_to_numpy(image)
+    pil = Image.fromarray(arr).convert("L")
+
+    # User drawings and batch images are expected to be dark strokes on a light background.
+    # MNIST-style models expect the foreground digit to be bright on dark.
     pil = ImageOps.invert(pil)
 
     arr = np.array(pil)
     ys, xs = np.where(arr > 20)
     if len(xs) == 0 or len(ys) == 0:
-        raise ValueError("Canvas appears empty. Please draw a digit.")
+        raise ValueError("Image appears empty after preprocessing.")
 
     x0, x1 = xs.min(), xs.max()
     y0, y1 = ys.min(), ys.max()
@@ -759,30 +785,38 @@ def make_probability_plot(probs: np.ndarray, class_names: List[str]) -> Image.Im
 
 
 
-def predict_from_canvas(state: Dict[str, Any], image: np.ndarray):
+def run_model_on_image(state: Dict[str, Any], image: Any) -> Tuple[Image.Image, np.ndarray, str, float]:
+    processed_pil, tensor = preprocess_image_for_model(image, state["image_size"])
+    x = tensor.unsqueeze(0)
+    mean = torch.tensor(state["mean"]).view(1, -1, 1, 1)
+    std = torch.tensor(state["std"]).view(1, -1, 1, 1)
+    x = (x - mean) / std
+    x = x.to(DEVICE)
+
+    model = state["model"]
+    model.eval()
+    with torch.no_grad():
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        pred_idx = int(np.argmax(probs))
+
+    pred_label = state["class_names"][pred_idx]
+    confidence = float(probs[pred_idx])
+    return processed_pil, probs, pred_label, confidence
+
+
+
+def predict_from_canvas(state: Dict[str, Any], image: Any):
     if not state or "model" not in state:
         return None, None, "Train a model first."
 
     try:
-        processed_pil, tensor = preprocess_canvas_image(image, state["image_size"])
-        x = tensor.unsqueeze(0)
-        mean = torch.tensor(state["mean"]).view(1, -1, 1, 1)
-        std = torch.tensor(state["std"]).view(1, -1, 1, 1)
-        x = (x - mean) / std
-        x = x.to(DEVICE)
-
-        model = state["model"]
-        model.eval()
-        with torch.no_grad():
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-            pred_idx = int(np.argmax(probs))
-
+        processed_pil, probs, pred_label, confidence = run_model_on_image(state, image)
         prob_img = make_probability_plot(probs, state["class_names"])
         top_lines = [
             f"### Prediction\n",
-            f"- **Predicted class:** {state['class_names'][pred_idx]}",
-            f"- **Confidence:** {probs[pred_idx]:.4f}",
+            f"- **Predicted class:** {pred_label}",
+            f"- **Confidence:** {confidence:.4f}",
             "\nTop scores:",
         ]
         top_ids = np.argsort(probs)[::-1][:5]
@@ -793,6 +827,106 @@ def predict_from_canvas(state: Dict[str, Any], image: np.ndarray):
 
     except Exception as exc:
         return None, None, f"Prediction failed: {exc}"
+
+
+
+def save_drawing_action(image: Any, filename: str) -> str:
+    try:
+        arr = editor_value_to_numpy(image)
+        pil = Image.fromarray(arr).convert("L")
+
+        filename = filename.strip() if filename else ""
+        if not filename:
+            filename = f"drawing_{int(time.time())}.png"
+
+        save_path = DRAWING_SAVE_DIR / filename
+        if save_path.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
+            save_path = save_path.with_suffix(".png")
+
+        pil.save(save_path)
+        return f"Saved drawing to: {save_path.resolve()}"
+    except Exception as exc:
+        return f"Save failed: {exc}"
+
+
+
+def extract_expected_label(filename: str) -> str:
+    stem = Path(filename).stem
+    return stem.split("_")[0] if "_" in stem else stem
+
+
+
+def load_batch_directory(directory_path: str):
+    try:
+        directory_path = (directory_path or "").strip()
+        if not directory_path:
+            return [], [], "Enter a directory path first."
+
+        directory = Path(directory_path).expanduser()
+        if not directory.exists() or not directory.is_dir():
+            return [], [], f"Directory not found: {directory}"
+
+        image_paths = sorted(
+            [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS],
+            key=lambda p: p.name.lower(),
+        )
+        if not image_paths:
+            return [], [], "No supported image files were found in the directory."
+
+        rows = [[p.name, extract_expected_label(p.name)] for p in image_paths]
+        msg = f"Loaded **{len(image_paths)}** image(s) from `{directory.resolve()}`."
+        return [str(p) for p in image_paths], rows, msg
+    except Exception as exc:
+        return [], [], f"Load failed: {exc}"
+
+
+
+def run_batch_test(state: Dict[str, Any], batch_paths: List[str]):
+    if not state or "model" not in state:
+        return [], "Train a model first."
+    if not batch_paths:
+        return [], "Load a directory first."
+
+    try:
+        results = []
+        scored_count = 0
+        correct_count = 0
+
+        for file_path in batch_paths:
+            path = Path(file_path)
+            expected_label = extract_expected_label(path.name)
+            _processed_pil, _probs, pred_label, confidence = run_model_on_image(state, path)
+
+            if expected_label in state["class_names"]:
+                is_correct = pred_label == expected_label
+                verdict = "correct" if is_correct else "not correct"
+                scored_count += 1
+                if is_correct:
+                    correct_count += 1
+            else:
+                verdict = "expected label not in model classes"
+
+            results.append([path.name, expected_label, pred_label, float(confidence), verdict])
+
+        if scored_count > 0:
+            accuracy = correct_count / scored_count
+            summary = (
+                f"### Batch test summary\n\n"
+                f"- **Images loaded:** {len(batch_paths)}\n"
+                f"- **Images scored against known classes:** {scored_count}\n"
+                f"- **Correct:** {correct_count}\n"
+                f"- **Batch accuracy:** {accuracy:.4f}"
+            )
+        else:
+            summary = (
+                f"### Batch test summary\n\n"
+                f"- **Images loaded:** {len(batch_paths)}\n"
+                f"- No filenames matched the current model classes, so accuracy was not computed."
+            )
+
+        return results, summary
+    except Exception as exc:
+        return [], f"Batch test failed: {exc}"
 
 
 # ============================================================
@@ -961,9 +1095,11 @@ Final classifier layer can use:
 ```
 """
 
+
 with gr.Blocks(title="CNN Playground") as demo:
     gr.Markdown(DESCRIPTION)
     app_state = gr.State(None)
+    batch_state = gr.State([])
 
     with gr.Tab("Build & Train"):
         with gr.Row():
@@ -1002,17 +1138,40 @@ with gr.Blocks(title="CNN Playground") as demo:
                     label="Draw a digit",
                     image_mode="L",
                     canvas_size=(280, 280),
-                    brush=gr.Brush(
-                        colors=["#000000", "#FFFFFF"], 
-                        default_size=18, 
-                        color_mode="fixed"
-                    ),
+                    brush=gr.Brush(colors=["#000000", "#FFFFFF"], default_size=18, color_mode="fixed"),
                 )
-                predict_btn = gr.Button("Predict drawing", variant="primary")
+                with gr.Row():
+                    predict_btn = gr.Button("Predict drawing", variant="primary")
+                    save_drawing_btn = gr.Button("Save drawing")
+                drawing_filename = gr.Textbox(value="7_1.png", label="Save drawing as", placeholder="Example: 7_1.png")
+                drawing_save_status = gr.Textbox(label="Drawing save status")
             with gr.Column(scale=1):
                 processed_image = gr.Image(label="Preprocessed 28x28 input")
                 probability_image = gr.Image(label="Class probabilities")
                 prediction_md = gr.Markdown()
+
+    with gr.Tab("Batch Test"):
+        with gr.Row():
+            batch_directory = gr.Textbox(
+                label="Image directory",
+                placeholder="Example: C:/Users/you/Documents/my_digit_dataset",
+            )
+            load_batch_btn = gr.Button("Load images")
+            run_batch_btn = gr.Button("Run batch test", variant="primary")
+        batch_load_md = gr.Markdown(
+            "Use a directory of images named like `1_1.jpg`, `7_2.png`, `a_1.png`, or `tree_1.png`."
+        )
+        batch_loaded_df = gr.Dataframe(
+            headers=["filename", "expected_label"],
+            datatype=["str", "str"],
+            label="Loaded files",
+        )
+        batch_results_df = gr.Dataframe(
+            headers=["filename", "expected_label", "predicted_label", "confidence", "result"],
+            datatype=["str", "str", "str", "number", "str"],
+            label="Batch results",
+        )
+        batch_summary_md = gr.Markdown()
 
     with gr.Tab("Feature Maps"):
         with gr.Row():
@@ -1043,6 +1202,9 @@ with gr.Blocks(title="CNN Playground") as demo:
         outputs=[app_state, history_image, confusion_image, summary_md, feature_layer, status_text],
     )
     predict_btn.click(predict_from_canvas, inputs=[app_state, sketch], outputs=[processed_image, probability_image, prediction_md])
+    save_drawing_btn.click(save_drawing_action, inputs=[sketch, drawing_filename], outputs=drawing_save_status)
+    load_batch_btn.click(load_batch_directory, inputs=[batch_directory], outputs=[batch_state, batch_loaded_df, batch_load_md])
+    run_batch_btn.click(run_batch_test, inputs=[app_state, batch_state], outputs=[batch_results_df, batch_summary_md])
     feature_btn.click(visualize_feature_maps, inputs=[app_state, feature_layer, feature_index], outputs=[sample_image, feature_image, feature_md])
     save_btn.click(save_model_action, inputs=[app_state, model_save_name], outputs=save_status)
 
